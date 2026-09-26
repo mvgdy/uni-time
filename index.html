@@ -37,14 +37,14 @@ main{padding:12px 12px 0}
 .tl li{display:flex;gap:10px;padding:10px 4px;border-bottom:1px solid var(--line);align-items:flex-start}
 .tl li:last-child{border-bottom:none}
 .dot{width:12px;height:12px;border-radius:50%;margin-top:6px;flex:none;background:#cbd5e1}
-.dot.done{background:var(--ok)}.dot.now{background:var(--acc);box-shadow:0 0 0 4px #bfdbfe}.dot.cls{background:#f59e0b}.dot.com{background:#8b5cf6}.dot.slp{background:#0f766e}.dot.meal{background:#fb7185}.dot.ex{background:#06b6d4}
+.dot.done{background:var(--ok)}.dot.now{background:var(--acc);box-shadow:0 0 0 4px #bfdbfe}.dot.cls{background:#f59e0b}.dot.com{background:#8b5cf6}.dot.slp{background:#0f766e}.dot.meal{background:#fb7185}.dot.ex{background:#06b6d4}.dot.trans{background:#fbbf24}.dot.free{background:#94a3b8}
 .ttime{font-variant-numeric:tabular-nums;font-weight:700;min-width:86px;font-size:14px}
 .tbody{flex:1}.tbody b{display:block}.tbody small{color:var(--mut)}
 .badge{display:inline-block;font-size:12px;font-weight:700;padding:2px 8px;border-radius:999px;background:#f1f5f9;margin-left:6px;vertical-align:middle}
-.badge.done{background:#dcfce7;color:#166534}.badge.hi{background:#fee2e2;color:#991b1b}.badge.med{background:#fef3c7;color:#92400e}.badge.low{background:#e0e7ff;color:#3730a3}
+.badge.done{background:#dcfce7;color:#166534}.badge.past{background:#e5e7eb;color:#57534e}.badge.hi{background:#fee2e2;color:#991b1b}.badge.med{background:#fef3c7;color:#92400e}.badge.low{background:#e0e7ff;color:#3730a3}
 .tact{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
 .tact button{min-height:40px;padding:6px 12px;border-radius:10px;border:1px solid var(--line);background:#f8fafc;font-weight:700;font-size:14px;cursor:pointer}
-li.isdone{opacity:.62}.li.isdone b{text-decoration:line-through}
+li.isdone{opacity:.62}li.isdone b{text-decoration:line-through}li.ispast{opacity:.55}
 nav.bottom{position:fixed;left:0;right:0;bottom:0;z-index:6;background:#fff;border-top:1px solid var(--line);display:flex;max-width:640px;margin:0 auto}
 nav.bottom button{flex:1;min-height:64px;border:none;background:#fff;font-size:15px;font-weight:700;cursor:pointer}
 nav.bottom button.on{background:#111;color:#fff}
@@ -174,56 +174,104 @@ function pad(n){return String(n).padStart(2,"0")}
 function dateKey(d){return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())}
 function t2m(t){const[a,b]=t.split(":").map(Number);return a*60+b}
 function m2t(m){return pad(Math.floor(m/60)%24)+":"+pad(m%60)}
-function nowMin(){const n=new Date();return n.getHours()*60+n.getMinutes()}
+function nowMin(){if(window.__testMin!=null)return window.__testMin;const n=new Date();return n.getHours()*60+n.getMinutes()}
 function subj(id){return CONFIG.subjects.find(s=>s.id===id)}
 /* ============ STORE ============ */
-let S={tasks:{},deadlines:[],energy:"normal",first:false,override:{},log:[],doneMin:{},sessions:{},exhaustedCommute:false};
+let S={tasks:{},deadlines:[],energy:"normal",first:false,override:{},log:[],doneMin:{},sessions:{},exhaustedCommute:false,schema:0};
 try{const raw=localStorage.getItem(LS);if(raw){const p=JSON.parse(raw);S=Object.assign(S,p)}}catch(e){}
 function save(){try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}}
-/* ============ GENERATION ============ */
+/* ============ TIME STATE (deterministic: clock vs interval only) ============ */
+// NOW: start <= now < end. UPCOMING: now < start. PAST: now >= end.
+// Priority NEVER affects NOW — it only ranks AI suggestions during free periods.
+function wraps(t){return t2m(t.end)<=t2m(t.start)}
+function containsAt(t,min){const s=t2m(t.start),e=t2m(t.end);if(e<=s)return min>=s||min<e;return s<=min&&min<e}
+function isPastAt(t,min){if(wraps(t))return false;return t2m(t.end)<=min}
+function timelineState(list,min){let now=null,next=null;for(const t of list){if(!now&&containsAt(t,min))now=t}for(const t of list){const s=t2m(t.start);if(s>min&&(!next||s<t2m(next.start)))next=t}return{now:now,next:next}}
+function topStudy(list){return list.filter(t=>t.kind==="study"&&t.status==="pending").sort((a,b)=>prW(b)-prW(a))[0]||null}
+// Suggestions are allowed only inside free/transition/meal periods — never during class, commute, sleep, exercise, rest, or an active study block.
+function suggestionFor(list,cur){if(!cur)return topStudy(list);if(cur.kind==="study")return null;if(cur.kind==="free"||cur.kind==="transition"||cur.kind==="meal")return topStudy(list);return null}
+/* ============ GENERATION (one continuous schedule, no silent gaps) ============ */
+const SCHEMA=2; // bump to regenerate cached days after scheduler fixes (done/skipped marks migrate)
+function placeLunch(classes){
+  const base=t2m(CONFIG.meals.lunch[0]);
+  const cands=[base,...classes.map(c=>t2m(c.end)).filter(e=>e>=base)].sort((a,b)=>a-b);
+  for(const s of cands){if(classes.every(c=>s+30<=t2m(c.start)||s>=t2m(c.end)))return{start:m2t(s),end:m2t(s+30)}}
+  const lastEnd=Math.max(...classes.map(c=>t2m(c.end)));
+  return{start:m2t(lastEnd),end:m2t(lastEnd+30)};
+}
+function fillGaps(list){
+  const sorted=[...list].sort((a,b)=>t2m(a.start)-t2m(b.start));
+  let n=list.length;
+  for(let j=0;j<sorted.length-1;j++){
+    const e=t2m(sorted[j].end), s=t2m(sorted[j+1].start);
+    if(s>e){
+      const dur=s-e, nearClass=sorted[j].kind==="class"||sorted[j+1].kind==="class";
+      const base={id:sorted[j].date+"-g"+(n++),date:sorted[j].date,status:"pending",actualMin:0,start:m2t(e),end:m2t(s)};
+      if(dur<=15)list.push(Object.assign(base,{kind:"break",title:"Break",detail:"Stretch · water"}));
+      else if(dur<=45&&nearClass)list.push(Object.assign(base,{kind:"transition",title:"Campus transition",detail:"Move · reset · get ready"}));
+      else list.push(Object.assign(base,{kind:"free",title:"Free time",detail:"No class — rest or light review"}));
+    }
+  }
+}
 function ensureDay(d){
   const k=dateKey(d), di=d.getDay();
-  if(S.tasks[k]) return S.tasks[k];
+  if(S.tasks[k]&&S.schema===SCHEMA) return S.tasks[k];
+  // migrate done/skipped marks when regenerating under a new schema
+  let oldMarks=null;
+  if(S.tasks[k]){oldMarks={};S.tasks[k].forEach(t=>{if(t.status==="done"||t.status==="skipped")oldMarks[t.kind+"|"+t.title+"|"+t.start]={status:t.status,actualMin:t.actualMin||0}});delete S.tasks[k];}
   const list=[]; let i=0;
-  const add=(kind,o)=>{list.push(Object.assign({id:k+"-"+(i++),date:k,kind,status:"pending",actualMin:0},o));};
+  const add=(kind,o)=>{const t=Object.assign({id:k+"-"+(i++),date:k,kind,status:"pending",actualMin:0},o);list.push(t);return t;};
   const overnight=S.override[k];
-  add("sleep",{title:"Wake up",detail:"Morning routine",start:"06:00",end:"06:30"});
-  add("meal",{title:"Breakfast",detail:"Eat + prep bag",start:CONFIG.meals.breakfast[0],end:CONFIG.meals.breakfast[1]});
-  const isUni=(CONFIG.classes[di]||[]).length>0;
+  const classes=[...(CONFIG.classes[di]||[])].sort((a,b)=>t2m(a.start)-t2m(b.start));
+  const isUni=classes.length>0;
   if(isUni||di===4){
+    add("sleep",{title:"Wake up",detail:"Morning routine",start:"06:00",end:"06:30"});
+    add("meal",{title:"Breakfast",detail:"Eat + prep bag",start:CONFIG.meals.breakfast[0],end:CONFIG.meals.breakfast[1]});
+    let lunch={start:CONFIG.meals.lunch[0],end:CONFIG.meals.lunch[1]};
+    let studyFrom=t2m("09:30");
     if(isUni){
       add("commute",{title:"Morning commute",detail:"Leave home "+CONFIG.commute.leaveHome+" → arrive "+CONFIG.commute.arriveUni,start:CONFIG.commute.leaveHome,end:CONFIG.commute.arriveUni,commute:"am"});
-      (CONFIG.classes[di]||[]).forEach(c=>{const s=subj(c.s);add("class",{title:s?s.name:c.s,detail:(s?s.code:"")+" · class",start:c.start,end:c.end,subjectId:c.s});});
-      add("meal",{title:"Lunch",detail:"Eat + short walk",start:CONFIG.meals.lunch[0],end:CONFIG.meals.lunch[1]});
-      add("commute",{title:"Evening commute",detail:"Recovery first · optional light review",start:CONFIG.commute.leaveUni,end:CONFIG.commute.arriveHome,commute:"pm"});
-      add("break",{title:"Rest after commute",detail:"Snack · no screens 10 min",start:"17:00",end:"17:30"});
+      classes.forEach(c=>{const s=subj(c.s);add("class",{title:s?s.name:c.s,detail:(s?s.code:"")+" · class",start:c.start,end:c.end,subjectId:c.s});});
+      lunch=placeLunch(classes);
+      add("meal",{title:"Lunch",detail:"Eat + short walk",start:lunch.start,end:lunch.end});
+      const lastEnd=Math.max(t2m(lunch.end),...classes.map(c=>t2m(c.end)));
+      const packE=lastEnd+15;
+      add("transition",{title:"Pack up and leave campus",detail:"Bag · water · bus",start:m2t(lastEnd),end:m2t(packE)});
+      const comDur=(CONFIG.commute.hoursEachWay||2)*60;
+      add("commute",{title:"Evening commute",detail:"Recovery first · optional light review",start:m2t(packE),end:m2t(packE+comDur),commute:"pm"});
+      add("break",{title:"Rest after commute",detail:"Snack · no screens 10 min",start:m2t(packE+comDur),end:m2t(packE+comDur+30)});
+      studyFrom=Math.max(t2m("17:30"),packE+comDur+30);
     }
-    // study blocks
+    // study blocks (skip meal/exercise windows, protect sleep)
     let strats=CONFIG.strategy[di]||[];
     if(S.energy==="exhausted"){strats=strats.slice(0,1).map(s=>[s[0],"Flashcards","Minimum: light review only",20]);}
     else if(S.energy==="low"){strats=strats.map(s=>[s[0],lightType(s[1]),s[2]+" (light)",Math.min(s[3],30)]);}
-    let cursor=isUni?"17:30":"09:30";
-    const dinnerM=t2m(CONFIG.meals.dinner[0]);
+    const skipWins=[[t2m(lunch.start),t2m(lunch.end)],[t2m(CONFIG.meals.dinner[0]),t2m("20:20")]];
+    const adv=c=>{let x=c;skipWins.forEach(w=>{if(x>=w[0]&&x<w[1])x=w[1]});return x};
+    let cursor=m2t(studyFrom);
+    const hard=t2m(CONFIG.sleep.hardStop);
     strats.forEach(st=>{
-      const dur=st[3]; let c=t2m(cursor);
-      if(isUni && c+dur>dinnerM-10){/* push after dinner */}
+      const dur=st[3];let c=adv(t2m(cursor));
+      skipWins.forEach(w=>{if(c<w[0]&&c+dur>w[0])c=w[1]});
+      c=adv(c);
       const end=c+dur;
-      const eT=m2t(end);
-      const hard=t2m(CONFIG.sleep.hardStop);
       if(!overnight && end>hard && isUni) return; // sleep protection
-      add("study",{title:(subj(st[0])||{}).name||st[0],detail:st[2],start:m2t(c),end:eT,durationMin:dur,subjectId:st[0],type:st[1],priority:(subj(st[0])||{}).pr||"medium"});
+      add("study",{title:(subj(st[0])||{}).name||st[0],detail:st[2],start:m2t(c),end:m2t(end),durationMin:dur,subjectId:st[0],type:st[1],priority:(subj(st[0])||{}).pr||"medium"});
       cursor=m2t(end+10); // 10 min break gap
-      if(!isUni && strats.length>3){/* Thursday keeps gaps */}
     });
     add("meal",{title:"Dinner",detail:"Real meal · away from desk",start:CONFIG.meals.dinner[0],end:CONFIG.meals.dinner[1]});
     add("exercise",{title:"Exercise",detail:"20 min walk / stretch",start:"20:00",end:"20:20"});
     add("break",{title:"Wind down",detail:"Prep tomorrow · lights low",start:"22:30",end:"23:00"});
     add("sleep",{title:"Sleep",detail:"Protected 7.5–8h",start:CONFIG.sleep.bed,end:"06:00"});
+    fillGaps(list);
   } else {
+    add("sleep",{title:"Wake up",detail:"Morning routine",start:"06:00",end:"06:30"});
+    add("meal",{title:"Breakfast",detail:"Eat + prep bag",start:CONFIG.meals.breakfast[0],end:CONFIG.meals.breakfast[1]});
     add("break",{title:"Friday free",detail:"Optional catch-up only — rest is the plan",start:"09:30",end:"10:00"});
     add("exercise",{title:"Exercise",detail:"Walk / move",start:"17:00",end:"17:30"});
     add("meal",{title:"Dinner",detail:"",start:CONFIG.meals.dinner[0],end:CONFIG.meals.dinner[1]});
     add("sleep",{title:"Sleep",detail:"Protected",start:CONFIG.sleep.bed,end:"06:00"});
+    fillGaps(list);
   }
   // deadlines due within 2 days → inject assignment task if study day
   S.deadlines.forEach(dl=>{
@@ -234,17 +282,17 @@ function ensureDay(d){
     }
   });
   list.sort((a,b)=>t2m(a.start)-t2m(b.start));
-  S.tasks[k]=list; save(); return list;
+  if(oldMarks)list.forEach(t=>{const o=oldMarks[t.kind+"|"+t.title+"|"+t.start];if(o){t.status=o.status;t.actualMin=o.actualMin||0}});
+  S.tasks[k]=list;S.schema=SCHEMA;save();return list;
 }
 function lightType(t){return ["Problem solving","Assignment","Practice"].includes(t)?"Flashcards":t}
 /* ============ TODAY RENDER ============ */
 function curList(){return ensureDay(new Date())}
 function statusFor(list){
-  const n=nowMin();
-  for(const t of list){if(t.status!=="done"&&t2m(t.start)<=n&&n<t2m(t.end))return t.kind==="study"?("Study: "+t.title):t.title;}
-  const nx=list.find(t=>t.status!=="done"&&t2m(t.start)>n);
-  if(!nx) return "Day complete — wind down";
-  return "Up next: "+nx.title+" at "+nx.start;
+  const s=timelineState(list,nowMin());
+  if(s.now)return s.now.kind==="study"?("Study: "+s.now.title):("Now: "+s.now.title);
+  if(s.next) return "Up next: "+s.next.title+" at "+s.next.start;
+  return "Day complete — wind down";
 }
 function render(){
   const now=new Date();
@@ -253,23 +301,32 @@ function render(){
   document.querySelectorAll(".energyrow button").forEach(b=>b.classList.toggle("on",b.dataset.e===S.energy));
   const list=curList();
   $("hStatus").textContent=statusFor(list);
-  // NOW / NEXT
+  // NOW / NEXT — timeline state always wins; study suggestion is separate and never becomes NOW early
   const n=nowMin();
-  let cur=list.find(t=>t.status!=="done"&&t2m(t.start)<=n&&n<t2m(t.end));
-  let nx=list.find(t=>t.status!=="done"&&t2m(t.start)>n);
-  if(!cur) cur=nx;
-  else if(cur.kind!=="study"){/* keep commute/class as NOW info */}
-  const studyNx=list.find(t=>t.kind==="study"&&t.status==="pending"&&t2m(t.start)>=n)||list.find(t=>t.kind==="study"&&t.status==="pending");
-  if(studyNx){$("nowTitle").textContent=studyNx.title;$("nowMeta").textContent=studyNx.durationMin+" min · "+studyNx.detail;$("nowStart").onclick=()=>openFocus(studyNx.id);$("nowHint").textContent="Scheduled "+studyNx.start+" · "+studyNx.type+" · "+studyNx.priority+" priority";}
-  else{$("nowTitle").textContent=cur?cur.title:"Done for today";$("nowMeta").textContent=cur?(cur.start+"–"+cur.end+" · "+(cur.detail||"")):"Rest and sleep.";$("nowStart").onclick=()=>toast("No study tasks left today.");$("nowHint").textContent="";}
+  const ts=timelineState(list,n);
+  const cur=ts.now, nx=ts.next;
+  const sug=suggestionFor(list,cur);
+  if(cur){
+    $("nowTitle").textContent=cur.title;
+    $("nowMeta").textContent=cur.start+"–"+cur.end+" · "+(cur.detail||cur.kind);
+    $("nowHint").textContent="NOW · "+cur.kind+(sug?(" · Suggested: "+sug.title+" ("+sug.durationMin+" min)."):"");
+    if(cur.kind==="study"&&cur.status==="pending"){$("nowStart").style.display="";$("nowStart").onclick=()=>openFocus(cur.id);}
+    else if(sug){$("nowStart").style.display="";$("nowStart").onclick=()=>openFocus(sug.id);}
+    else{$("nowStart").style.display="none";}
+  }
+  else{$("nowTitle").textContent="Done for today";$("nowMeta").textContent="Rest and sleep.";$("nowHint").textContent="";$("nowStart").style.display="none";}
   if(nx){$("nextTitle").textContent=nx.title;$("nextMeta").textContent=nx.start+"–"+nx.end+" · "+(nx.detail||nx.kind);}
+  else if(cur&&cur.kind==="sleep"){$("nextTitle").textContent="Wake up 06:00";$("nextMeta").textContent="Tomorrow starts fresh";}
+  else{$("nextTitle").textContent="—";$("nextMeta").textContent="Day complete";}
   // timeline
   const ul=$("tl");ul.innerHTML="";
   list.forEach(t=>{
-    const li=document.createElement("li");if(t.status==="done")li.className="isdone";
-    const dot=t.status==="done"?"dot done":(t.kind==="class"?"dot cls":t.kind==="commute"?"dot com":t.kind==="sleep"?"dot slp":t.kind==="meal"?"dot meal":t.kind==="exercise"?"dot ex":"dot");
+    const isNow=cur&&cur.id===t.id;
+    const past=t.status!=="done"&&isPastAt(t,n);
+    const li=document.createElement("li");li.className=t.status==="done"?"isdone":(past?"ispast":"");
+    const dot=t.status==="done"?"dot done":isNow?"dot now":(t.kind==="class"?"dot cls":t.kind==="commute"?"dot com":t.kind==="sleep"?"dot slp":t.kind==="meal"?"dot meal":t.kind==="exercise"?"dot ex":t.kind==="transition"?"dot trans":t.kind==="free"?"dot free":"dot");
     const pr=t.priority==="high"?'<span class="badge hi">high</span>':t.priority==="medium"?'<span class="badge med">med</span>':t.priority==="low"?'<span class="badge low">low</span>':"";
-    const st=t.status==="done"?'<span class="badge done">done</span>':"";
+    const st=t.status==="done"?'<span class="badge done">done</span>':(past?'<span class="badge past">past</span>':"");
     li.innerHTML='<span class="'+dot+'"></span><span class="ttime">'+t.start+"<br>"+t.end+'</span><span class="tbody"><b>'+esc(t.title)+pr+st+'</b><small>'+esc(t.detail||t.kind)+(t.durationMin?" · "+t.durationMin+" min":"")+(t.actualMin?" · did "+t.actualMin+"m":"")+'</small><span class="tact"></span></span>';
     const ac=li.querySelector(".tact");
     if(t.kind==="study"&&t.status!=="done"){const b1=document.createElement("button");b1.textContent="Start";b1.onclick=()=>openFocus(t.id);const b2=document.createElement("button");b2.textContent="Done";b2.onclick=()=>completeTask(t.id,t.durationMin);const b3=document.createElement("button");b3.textContent="Missed";b3.onclick=()=>missTask(t.id);ac.append(b1,b2,b3);}
@@ -330,7 +387,8 @@ function onFocusDone(manual){
 /* ============ COMMUTE ============ */
 function openCommute(){
   const h=new Date().getHours();const am=h<12;
-  $("commSub").textContent=am?"Morning "+CONFIG.commute.leaveHome+"–"+CONFIG.commute.arriveUni+" · lightweight review only":"Evening "+CONFIG.commute.leaveUni+"–"+CONFIG.commute.arriveHome+" · recovery first";
+  const dl0=curList();const amB=dl0.find(x=>x.kind==="commute"&&x.commute==="am");const pmB=dl0.find(x=>x.kind==="commute"&&x.commute==="pm");
+  $("commSub").textContent=am?("Morning "+(amB?amB.start+"–"+amB.end:CONFIG.commute.leaveHome+"–"+CONFIG.commute.arriveUni)+" · lightweight review only"):("Evening "+(pmB?pmB.start+"–"+pmB.end:CONFIG.commute.leaveUni+"–"+CONFIG.commute.arriveHome)+" · recovery first");
   const day=new Date().getDay();
   const cls=(CONFIG.classes[day]||[]).map(c=>subj(c.s)?subj(c.s).name:c.s).join(", ")||"no classes";
   const items=am?["Formula sheet: "+firstClassSubj(day)+" key formulas","5 flashcards: German vocabulary","Read today's lecture notes once","Review yesterday's mistakes (max 10 min)"]:["Rest · music · window (default)","Optional: 10-min German vocab only","Optional: reread one page of notes","If exhausted: nothing — sleep protects tomorrow"];
@@ -373,7 +431,9 @@ function catchUpAll(){
 function planSummary(){
   const d=new Date(),l=curList();const st=l.filter(t=>t.kind==="study"&&t.status==="pending");
   const tot=st.reduce((a,t)=>a+(t.durationMin||0),0);
-  return "Plan for "+DAYN[d.getDay()]+": "+st.length+" study block(s), "+tot+" min total. Leave "+CONFIG.commute.leaveHome+", first class "+firstClassLine(d)+". Rest 17:00–17:30. Stop study by 23:00. Sleep "+CONFIG.sleep.bed+"–"+CONFIG.sleep.wake+".";
+  const am=l.find(t=>t.kind==="commute"&&t.commute==="am");
+  const rest=l.find(t=>/Rest after commute/.test(t.title));
+  return "Plan for "+DAYN[d.getDay()]+": "+st.length+" study block(s), "+tot+" min total."+(am?(" Leave "+am.start+", arrive "+am.end+"."):"")+(rest?(" Rest "+rest.start+"–"+rest.end+"."):"")+" First class "+firstClassLine(d)+". Stop study by 23:00. Sleep "+CONFIG.sleep.bed+"–"+CONFIG.sleep.wake+".";
 }
 function firstClassLine(d){const c=(CONFIG.classes[d.getDay()]||[])[0];return c?((subj(c.s)||{}).name+" at "+c.start):"none — rest day"}
 /* ============ WEEK + SUBJECTS ============ */
@@ -406,9 +466,14 @@ function renderSubj(){
 /* ============ TOMORROW ============ */
 function renderTomorrow(){
   const t=new Date();t.setDate(t.getDate()+1);
+  const l=ensureDay(t);
   const cls=CONFIG.classes[t.getDay()]||[];
   const first=cls.length?((subj(cls[0].s)||{}).name+" at "+cls[0].start):"No classes — rest / consolidation";
-  $("tomBody").innerHTML="Leave <b>"+CONFIG.commute.leaveHome+"</b> · arrive "+CONFIG.commute.arriveUni+"<br>First: <b>"+esc(first)+"</b><br>Commute review: "+esc(firstClassSubj(t.getDay()))+" formulas + German vocab<br>Rest 17:00–17:30 · evening study 1–2h max · stop 23:00 · sleep "+CONFIG.sleep.bed;
+  const am=l.find(x=>x.kind==="commute"&&x.commute==="am");
+  const rest=l.find(x=>/Rest after commute/.test(x.title));
+  const st=l.filter(x=>x.kind==="study");
+  const tot=st.reduce((a,x)=>a+(x.durationMin||0),0);
+  $("tomBody").innerHTML=(am?("Leave <b>"+am.start+"</b> · arrive "+am.end+"<br>"):"")+"First: <b>"+esc(first)+"</b><br>Commute review: "+esc(firstClassSubj(t.getDay()))+" formulas + German vocab"+(rest?("<br>Rest "+rest.start+"–"+rest.end):"")+(st.length?("<br>Evening study: "+st.length+" block(s), "+tot+" min · stop 23:00"):"<br>No evening study — rest day")+" · sleep "+CONFIG.sleep.bed;
   if(!S.first){$("firstBody").innerHTML="<div class='kv'><b>Tomorrow ("+DAYN[t.getDay()]+")</b><br>Leave "+CONFIG.commute.leaveHome+" · "+esc(first)+"<br>Commute: light review · Evening: rest then study · Sleep "+CONFIG.sleep.bed+"</div>";$("first").classList.add("open")}
 }
 $("firstGo").onclick=()=>{S.first=true;save();$("first").classList.remove("open")};
@@ -421,7 +486,7 @@ function agentAsk(q){
 function agentAnswer(q0){
   const q=q0.toLowerCase();const l=curList();const n=nowMin();
   const pend=l.filter(t=>t.kind==="study"&&t.status==="pending");
-  if(q.includes("what should i do now")||q==="what should i do now?"||q.includes("now?")||q.includes("now")){const t=pend[0];return t?("Do now: "+t.title+" — "+t.detail+" ("+t.durationMin+" min, "+t.type+"). Start it, then rest."):("Nothing pending. "+statusFor(l)+".");}
+  if(q.includes("what should i do now")||q==="what should i do now?"||q.includes("now?")||q.includes("now")){const s=timelineState(l,nowMin());const loc=s.now?("Timeline now ("+m2t(nowMin())+"): "+s.now.title+" until "+s.now.end+"."):"Day complete.";const g=suggestionFor(l,s.now);if(g)return loc+" Useful next: "+g.title+" ("+g.durationMin+" min, "+g.type+").";return loc+(s.next?(" Next: "+s.next.title+" at "+s.next.start+"."):"");}
   if(q.includes("40 minutes")||q.includes("30 min")||q.includes("only have")){const t=[...pend].sort((a,b)=>prW(b)-prW(a))[0];return t?("With ~40 min: do "+t.title+" for 30 min ("+t.type+"), keep 10 min buffer. Highest priority first."):"You have no pending study — rest.";}
   if(q.includes("tired")||q.includes("exhausted")||q.includes("low energy")){return "Tired plan: drop problem sets. Do 20 min flashcards + 20 min note review, then sleep by "+CONFIG.sleep.bed+". I set Low energy for you.";}
   if(q.includes("missed")||q.includes("signals session")){const t=pend.find(x=>x.subjectId==="EEC115")||pend[0];return t?("I moved your missed "+t.title+" ("+t.durationMin+" min): half to Thursday, half as optional Friday. Tap Missed on the task to apply it. Sleep unchanged."):"No pending Signals — you are caught up.";}
@@ -450,7 +515,7 @@ $("editSave").onclick=()=>{try{const d=+$("editDay").value;const v=JSON.parse($(
 try{const c=localStorage.getItem("uni_classes");if(c)CONFIG.classes=Object.assign(CONFIG.classes,JSON.parse(c))}catch(e){}
 $("editJson").value=JSON.stringify(CONFIG.classes[6]||[]);
 function notify(t,b){try{if("Notification"in window&&Notification.permission==="granted"){new Notification(t,{body:b||""})}if("Notification"in window&&Notification.permission==="default"){Notification.requestPermission()}}catch(e){}}
-setInterval(()=>{render()},60000);
+setInterval(()=>{render()},30000);
 setInterval(()=>{ // gentle reminders without dependency
   try{const l=curList();const n=nowMin();l.forEach(t=>{if(t.status==="pending"&&t2m(t.start)-n===10)notify(t.title+" in 10 min",t.start)})}catch(e){}
 },60000);
@@ -458,7 +523,7 @@ if("Notification"in window&&Notification.permission==="default"){try{Notificatio
 render();
 setInterval(()=>{const n=new Date();$("hClock").textContent=pad(n.getHours())+":"+pad(n.getMinutes())+":"+pad(n.getSeconds())},1000);
 $("hClock").textContent=pad(new Date().getHours())+":"+pad(new Date().getMinutes());
-window.__app={CONFIG,getState:()=>S,ensureDay,completeTask,missTask,agentAnswer};
+window.__app={CONFIG,getState:()=>S,ensureDay,completeTask,missTask,agentAnswer,timelineState,containsAt,suggestionFor};
 </script>
 </body>
 </html>
