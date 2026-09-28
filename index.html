@@ -134,7 +134,7 @@ table.w th,table.w td{text-align:left;padding:8px 6px;border-bottom:1px solid va
 "use strict";
 /* ============ CENTRAL CONFIG — edit easily ============ */
 const CONFIG = {
-  commute: { leaveHome:"07:00", arriveUni:"09:00", leaveUni:"15:00", arriveHome:"17:00", hoursEachWay:2 },
+  commute: { leaveHome:"07:00", arriveUni:"09:00", durationMin:120 }, // COMMUTE_DURATION_MINUTES — return commute is always derived: leaveCampusTime + durationMin. No fixed return times anywhere.
   sleep: { bed:"23:00", wake:"06:00", targetHrs:7.5, hardStop:"23:00" },
   meals: { breakfast:["06:30","07:00"], lunch:["12:30","13:00"], dinner:["19:30","20:00"] },
   exerciseMin: 20,
@@ -177,7 +177,7 @@ function m2t(m){return pad(Math.floor(m/60)%24)+":"+pad(m%60)}
 function nowMin(){if(window.__testMin!=null)return window.__testMin;const n=new Date();return n.getHours()*60+n.getMinutes()}
 function subj(id){return CONFIG.subjects.find(s=>s.id===id)}
 /* ============ STORE ============ */
-let S={tasks:{},deadlines:[],energy:"normal",first:false,override:{},log:[],doneMin:{},sessions:{},exhaustedCommute:false,schema:0};
+let S={tasks:{},deadlines:[],energy:"normal",first:false,override:{},log:[],doneMin:{},sessions:{},exhaustedCommute:false,schema:0,v:{},fp:{}};
 try{const raw=localStorage.getItem(LS);if(raw){const p=JSON.parse(raw);S=Object.assign(S,p)}}catch(e){}
 function save(){try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}}
 /* ============ TIME STATE (deterministic: clock vs interval only) ============ */
@@ -185,12 +185,29 @@ function save(){try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}}
 // Priority NEVER affects NOW — it only ranks AI suggestions during free periods.
 function wraps(t){return t2m(t.end)<=t2m(t.start)}
 function containsAt(t,min){const s=t2m(t.start),e=t2m(t.end);if(e<=s)return min>=s||min<e;return s<=min&&min<e}
-function isPastAt(t,min){if(wraps(t))return false;return t2m(t.end)<=min}
+function isPastAt(t,min){if(t2m(t.start)===t2m(t.end))return false;if(wraps(t))return false;return t2m(t.end)<=min}
+// Clock-derived event state for time-based events (no manual Done needed):
+// done (user-marked) · in-progress (contains now) · completed (past) · upcoming (future)
+function eventState(t,min){if(t.status==="done")return"done";if(containsAt(t,min))return"in-progress";if(isPastAt(t,min))return"completed";return"upcoming"}
 function timelineState(list,min){let now=null,next=null;for(const t of list){if(!now&&containsAt(t,min))now=t}for(const t of list){const s=t2m(t.start);if(s>min&&(!next||s<t2m(next.start)))next=t}return{now:now,next:next}}
 function topStudy(list){return list.filter(t=>t.kind==="study"&&t.status==="pending").sort((a,b)=>prW(b)-prW(a))[0]||null}
 // Suggestions are allowed only inside free/transition/meal periods — never during class, commute, sleep, exercise, rest, or an active study block.
 function suggestionFor(list,cur){if(!cur)return topStudy(list);if(cur.kind==="study")return null;if(cur.kind==="free"||cur.kind==="transition"||cur.kind==="meal")return topStudy(list);return null}
-/* ============ GENERATION (one continuous schedule, no silent gaps) ============ */
+/* ============ SCHEDULING ENGINE (generic pipeline, works for EVERY day) ============
+   BASE SCHEDULE → CLASS EVENTS → TRANSITION/MEAL EVENTS → LEAVE-CAMPUS EVENT
+   → DERIVE RETURN COMMUTE (leaveCampusTime + COMMUTE_DURATION) → RECOVERY
+   → STUDY IN AVAILABLE WINDOWS → DAILY TIMELINE → NOW/NEXT/UPCOMING
+   No weekday branches: pipeline choice is driven by the day's own data
+   (has classes? has a study plan?). No fixed return-commute times anywhere. */
+function dayFingerprint(di){return JSON.stringify([CONFIG.classes[di]||[],CONFIG.strategy[di]||[],CONFIG.commute,CONFIG.meals,CONFIG.sleep])}
+function deriveLeaveCampus(classes,lunch){return Math.max(t2m(lunch.end),...classes.map(c=>t2m(c.end)))}
+function deriveEveningCommute(packEndMin){const d=CONFIG.commute.durationMin||120;return{start:m2t(packEndMin),end:m2t(packEndMin+d)}}
+function leaveCampusFrom(list){
+  const b=list.find(t=>/Pack up and leave campus/.test(t.title));
+  if(b)return t2m(b.end);
+  const ends=list.filter(t=>(t.kind==="class"||t.title==="Lunch")).map(t=>t2m(t.end));
+  return ends.length?Math.max(...ends):t2m("13:00");
+}
 const SCHEMA=2; // bump to regenerate cached days after scheduler fixes (done/skipped marks migrate)
 function placeLunch(classes){
   const base=t2m(CONFIG.meals.lunch[0]);
@@ -215,7 +232,12 @@ function fillGaps(list){
 }
 function ensureDay(d){
   const k=dateKey(d), di=d.getDay();
-  if(S.tasks[k]&&S.schema===SCHEMA) return S.tasks[k];
+  S.v=S.v||{};S.fp=S.fp||{};
+  const fp=dayFingerprint(di);
+  // Per-day version gate: a GLOBAL flag poisoned sibling days (Saturday migrated,
+  // then Sun–Fri early-returned stale forever). Each day regenerates independently
+  // when the engine version OR its own inputs (classes/strategy/commute/meals/sleep) change.
+  if(S.tasks[k]&&S.v[k]===SCHEMA&&S.fp[k]===fp) return S.tasks[k];
   // migrate done/skipped marks when regenerating under a new schema
   let oldMarks=null;
   if(S.tasks[k]){oldMarks={};S.tasks[k].forEach(t=>{if(t.status==="done"||t.status==="skipped")oldMarks[t.kind+"|"+t.title+"|"+t.start]={status:t.status,actualMin:t.actualMin||0}});delete S.tasks[k];}
@@ -223,8 +245,10 @@ function ensureDay(d){
   const add=(kind,o)=>{const t=Object.assign({id:k+"-"+(i++),date:k,kind,status:"pending",actualMin:0},o);list.push(t);return t;};
   const overnight=S.override[k];
   const classes=[...(CONFIG.classes[di]||[])].sort((a,b)=>t2m(a.start)-t2m(b.start));
+  const baseStrats=CONFIG.strategy[di]||[];
   const isUni=classes.length>0;
-  if(isUni||di===4){
+  const hasStudyPlan=baseStrats.length>0;
+  if(isUni||hasStudyPlan){
     add("sleep",{title:"Wake up",detail:"Morning routine",start:"06:00",end:"06:30"});
     add("meal",{title:"Breakfast",detail:"Eat + prep bag",start:CONFIG.meals.breakfast[0],end:CONFIG.meals.breakfast[1]});
     let lunch={start:CONFIG.meals.lunch[0],end:CONFIG.meals.lunch[1]};
@@ -234,13 +258,16 @@ function ensureDay(d){
       classes.forEach(c=>{const s=subj(c.s);add("class",{title:s?s.name:c.s,detail:(s?s.code:"")+" · class",start:c.start,end:c.end,subjectId:c.s});});
       lunch=placeLunch(classes);
       add("meal",{title:"Lunch",detail:"Eat + short walk",start:lunch.start,end:lunch.end});
-      const lastEnd=Math.max(t2m(lunch.end),...classes.map(c=>t2m(c.end)));
-      const packE=lastEnd+15;
-      add("transition",{title:"Pack up and leave campus",detail:"Bag · water · bus",start:m2t(lastEnd),end:m2t(packE)});
-      const comDur=(CONFIG.commute.hoursEachWay||2)*60;
-      add("commute",{title:"Evening commute",detail:"Recovery first · optional light review",start:m2t(packE),end:m2t(packE+comDur),commute:"pm"});
-      add("break",{title:"Rest after commute",detail:"Snack · no screens 10 min",start:m2t(packE+comDur),end:m2t(packE+comDur+30)});
-      studyFrom=Math.max(t2m("17:30"),packE+comDur+30);
+      // LEAVE-CAMPUS is its own concept (I may stay on campus after class):
+      // last class → transition/lunch/free → leave campus → derive return commute.
+      const leaveMin=deriveLeaveCampus(classes,lunch);
+      const packEnd=leaveMin+15;
+      add("transition",{title:"Pack up and leave campus",detail:"Bag · water · bus",start:m2t(leaveMin),end:m2t(packEnd)});
+      const com=deriveEveningCommute(packEnd);
+      add("commute",{title:"Evening commute",detail:"Recovery first · optional light review",start:com.start,end:com.end,commute:"pm"});
+      const restEnd=t2m(com.end)+30;
+      add("break",{title:"Rest after commute",detail:"Snack · no screens 10 min",start:com.end,end:m2t(restEnd)});
+      studyFrom=Math.max(t2m("17:30"),restEnd);
     }
     // study blocks (skip meal/exercise windows, protect sleep)
     let strats=CONFIG.strategy[di]||[];
@@ -283,7 +310,7 @@ function ensureDay(d){
   });
   list.sort((a,b)=>t2m(a.start)-t2m(b.start));
   if(oldMarks)list.forEach(t=>{const o=oldMarks[t.kind+"|"+t.title+"|"+t.start];if(o){t.status=o.status;t.actualMin=o.actualMin||0}});
-  S.tasks[k]=list;S.schema=SCHEMA;save();return list;
+  S.tasks[k]=list;S.v[k]=SCHEMA;S.fp[k]=fp;save();return list;
 }
 function lightType(t){return ["Problem solving","Assignment","Practice"].includes(t)?"Flashcards":t}
 /* ============ TODAY RENDER ============ */
@@ -314,6 +341,17 @@ function render(){
     else if(sug){$("nowStart").style.display="";$("nowStart").onclick=()=>openFocus(sug.id);}
     else{$("nowStart").style.display="none";}
   }
+  // "Done for today" ONLY when nothing remains: no current event, no later event
+  // (a future study block counts as a later event — finishing study never ends the day
+  // while lunch, commute, exercise, dinner or sleep are still ahead).
+  else if(nx){
+    $("nowTitle").textContent=nx.title;
+    $("nowMeta").textContent="Starts "+nx.start+" · "+(nx.detail||nx.kind);
+    const sug2=topStudy(list);
+    $("nowHint").textContent="UPCOMING · "+nx.kind+(sug2?(" · Suggested: "+sug2.title+" ("+sug2.durationMin+" min)."):"");
+    if(sug2){$("nowStart").style.display="";$("nowStart").onclick=()=>openFocus(sug2.id);}
+    else{$("nowStart").style.display="none";}
+  }
   else{$("nowTitle").textContent="Done for today";$("nowMeta").textContent="Rest and sleep.";$("nowHint").textContent="";$("nowStart").style.display="none";}
   if(nx){$("nextTitle").textContent=nx.title;$("nextMeta").textContent=nx.start+"–"+nx.end+" · "+(nx.detail||nx.kind);}
   else if(cur&&cur.kind==="sleep"){$("nextTitle").textContent="Wake up 06:00";$("nextMeta").textContent="Tomorrow starts fresh";}
@@ -321,16 +359,18 @@ function render(){
   // timeline
   const ul=$("tl");ul.innerHTML="";
   list.forEach(t=>{
+    // Time-based events (commute/class/meals/sleep/...) get their state from the clock:
+    // UPCOMING (no badge) · IN_PROGRESS (ring) · COMPLETED (badge). No manual Done needed.
+    // Manual Start/Done/Missed stays for study tasks only.
+    const st8=eventState(t,n);
     const isNow=cur&&cur.id===t.id;
-    const past=t.status!=="done"&&isPastAt(t,n);
-    const li=document.createElement("li");li.className=t.status==="done"?"isdone":(past?"ispast":"");
+    const li=document.createElement("li");li.className=t.status==="done"?"isdone":(st8==="completed"?"ispast":"");
     const dot=t.status==="done"?"dot done":isNow?"dot now":(t.kind==="class"?"dot cls":t.kind==="commute"?"dot com":t.kind==="sleep"?"dot slp":t.kind==="meal"?"dot meal":t.kind==="exercise"?"dot ex":t.kind==="transition"?"dot trans":t.kind==="free"?"dot free":"dot");
     const pr=t.priority==="high"?'<span class="badge hi">high</span>':t.priority==="medium"?'<span class="badge med">med</span>':t.priority==="low"?'<span class="badge low">low</span>':"";
-    const st=t.status==="done"?'<span class="badge done">done</span>':(past?'<span class="badge past">past</span>':"");
+    const st=t.status==="done"?'<span class="badge done">done</span>':(st8==="completed"?'<span class="badge past">completed</span>':"");
     li.innerHTML='<span class="'+dot+'"></span><span class="ttime">'+t.start+"<br>"+t.end+'</span><span class="tbody"><b>'+esc(t.title)+pr+st+'</b><small>'+esc(t.detail||t.kind)+(t.durationMin?" · "+t.durationMin+" min":"")+(t.actualMin?" · did "+t.actualMin+"m":"")+'</small><span class="tact"></span></span>';
     const ac=li.querySelector(".tact");
     if(t.kind==="study"&&t.status!=="done"){const b1=document.createElement("button");b1.textContent="Start";b1.onclick=()=>openFocus(t.id);const b2=document.createElement("button");b2.textContent="Done";b2.onclick=()=>completeTask(t.id,t.durationMin);const b3=document.createElement("button");b3.textContent="Missed";b3.onclick=()=>missTask(t.id);ac.append(b1,b2,b3);}
-    else if(t.status!=="done"&&(t.kind!=="study")){const b=document.createElement("button");b.textContent="Done";b.onclick=()=>completeTask(t.id,0);ac.append(b);}
     ul.append(li);
   });
   // deadlines
@@ -388,7 +428,7 @@ function onFocusDone(manual){
 function openCommute(){
   const h=new Date().getHours();const am=h<12;
   const dl0=curList();const amB=dl0.find(x=>x.kind==="commute"&&x.commute==="am");const pmB=dl0.find(x=>x.kind==="commute"&&x.commute==="pm");
-  $("commSub").textContent=am?("Morning "+(amB?amB.start+"–"+amB.end:CONFIG.commute.leaveHome+"–"+CONFIG.commute.arriveUni)+" · lightweight review only"):("Evening "+(pmB?pmB.start+"–"+pmB.end:CONFIG.commute.leaveUni+"–"+CONFIG.commute.arriveHome)+" · recovery first");
+  $("commSub").textContent=am?("Morning "+(amB?amB.start+"–"+amB.end:"07:00–09:00")+" · lightweight review only"):("Evening "+(pmB?pmB.start+"–"+pmB.end:"after last class")+" · recovery first");
   const day=new Date().getDay();
   const cls=(CONFIG.classes[day]||[]).map(c=>subj(c.s)?subj(c.s).name:c.s).join(", ")||"no classes";
   const items=am?["Formula sheet: "+firstClassSubj(day)+" key formulas","5 flashcards: German vocabulary","Read today's lecture notes once","Review yesterday's mistakes (max 10 min)"]:["Rest · music · window (default)","Optional: 10-min German vocab only","Optional: reread one page of notes","If exhausted: nothing — sleep protects tomorrow"];
@@ -523,7 +563,7 @@ if("Notification"in window&&Notification.permission==="default"){try{Notificatio
 render();
 setInterval(()=>{const n=new Date();$("hClock").textContent=pad(n.getHours())+":"+pad(n.getMinutes())+":"+pad(n.getSeconds())},1000);
 $("hClock").textContent=pad(new Date().getHours())+":"+pad(new Date().getMinutes());
-window.__app={CONFIG,getState:()=>S,ensureDay,completeTask,missTask,agentAnswer,timelineState,containsAt,suggestionFor};
+window.__app={CONFIG,getState:()=>S,ensureDay,completeTask,missTask,agentAnswer,timelineState,containsAt,suggestionFor,eventState,deriveLeaveCampus,deriveEveningCommute,leaveCampusFrom,dayFingerprint};
 </script>
 </body>
 </html>
