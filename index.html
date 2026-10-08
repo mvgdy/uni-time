@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Uni Time — Today</title>
 <style>
-:root{--bg:#f6f4ec;--ink:#1a1a18;--mut:#6b675e;--card:#ffffff;--line:#e5e0d2;--acc:#1d4ed8;--acc2:#0f766e;--warn:#b45309;--bad:#b91c1c;--ok:#15803d;--r:14px}
+:root{--bg:#f6f4ec;--ink:#1a1a18;--mut:#6b675e;--card:#ffffff;--line:#e5e0d2;--acc:#1d4ed8;--acc2:#0f766e;--ok:#15803d;--r:14px}
 *{box-sizing:border-box}html,body{margin:0;padding:0}
 body{background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;font-size:17px;line-height:1.45;max-width:640px;margin:0 auto;padding:0 0 96px}
 header.top{position:sticky;top:0;z-index:5;background:var(--bg);padding:14px 16px 10px;border-bottom:1px solid var(--line)}
@@ -138,7 +138,6 @@ const CONFIG = {
   sleep: { bed:"23:00", wake:"06:00", targetHrs:7.5, hardStop:"23:00" },
   meals: { breakfast:["06:30","07:00"], lunch:["12:30","13:00"], dinner:["19:30","20:00"] },
   exerciseMin: 20,
-  uniDayStudyMin: [60,120], thursdayStudyMin: [240,300],
   subjects: [
     {id:"EEC115", name:"Signals and Systems", code:"EEC 115-1", pr:"high", focus:50, brk:10},
     {id:"EEC103", name:"Principles of Electrical Machines", code:"EEC 103-1", pr:"high", focus:50, brk:10},
@@ -163,8 +162,7 @@ const CONFIG = {
     3:[["LNG102","Flashcards","German vocabulary + phrases",40],["EEC103","Lecture review","Electrical Machines review",30]],
     4:[["EEC115","Problem solving","Consolidation: Signals",60],["EEC103","Problem solving","Consolidation: Machines",60],["EEC113","Practice","Consolidation: Computer Eng",50],["LNG102","Flashcards","Consolidation: German",30],["HUM109","Reading","Consolidation: Research",30],["HUM101","Reading","Consolidation: History",20]],
     5:[]
-  },
-  taskTypes:["Lecture review","Problem solving","Assignment","Reading","Flashcards","Formula review","Practice","Planning","Catch-up"]
+  }
 };
 const DAYN=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 const LS="uni_mvp_v1";
@@ -177,7 +175,7 @@ function m2t(m){return pad(Math.floor(m/60)%24)+":"+pad(m%60)}
 function nowMin(){if(window.__testMin!=null)return window.__testMin;const n=new Date();return n.getHours()*60+n.getMinutes()}
 function subj(id){return CONFIG.subjects.find(s=>s.id===id)}
 /* ============ STORE ============ */
-let S={tasks:{},deadlines:[],energy:"normal",first:false,override:{},log:[],doneMin:{},sessions:{},exhaustedCommute:false,schema:0,v:{},fp:{}};
+let S={tasks:{},deadlines:[],energy:"normal",first:false,override:{},sessions:{},v:{},fp:{}};
 try{const raw=localStorage.getItem(LS);if(raw){const p=JSON.parse(raw);S=Object.assign(S,p)}}catch(e){}
 function save(){try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}}
 /* ============ TIME STATE (deterministic: clock vs interval only) ============ */
@@ -209,12 +207,6 @@ function suggestionFor(list,cur){if(!cur)return topStudy(list);if(cur.kind==="st
 function dayFingerprint(di){return JSON.stringify([CONFIG.classes[di]||[],CONFIG.strategy[di]||[],CONFIG.commute,CONFIG.meals,CONFIG.sleep])}
 function deriveLeaveCampus(classes,lunch){return Math.max(t2m(lunch.end),...classes.map(c=>t2m(c.end)))}
 function deriveEveningCommute(packEndMin){const d=CONFIG.commute.durationMin||120;return{start:m2t(packEndMin),end:m2t(packEndMin+d)}}
-function leaveCampusFrom(list){
-  const b=list.find(t=>/Pack up and leave campus/.test(t.title));
-  if(b)return t2m(b.end);
-  const ends=list.filter(t=>(t.kind==="class"||t.title==="Lunch")).map(t=>t2m(t.end));
-  return ends.length?Math.max(...ends):t2m("13:00");
-}
 const SCHEMA=2; // bump to regenerate cached days after scheduler fixes (done/skipped marks migrate)
 function placeLunch(classes){
   const base=t2m(CONFIG.meals.lunch[0]);
@@ -322,22 +314,16 @@ function ensureDay(d){
 function lightType(t){return ["Problem solving","Assignment","Practice"].includes(t)?"Flashcards":t}
 /* ============ TODAY RENDER ============ */
 function curList(){return ensureDay(new Date())}
-function statusFor(list){
-  const s=timelineState(list,nowMin());
-  if(s.now)return s.now.kind==="study"?("Study: "+s.now.title):("Now: "+s.now.title);
-  if(s.next) return "Up next: "+s.next.title+" at "+s.next.start;
-  return "Day complete — wind down";
-}
 function render(){
   const now=new Date();
   $("hDay").textContent=DAYN[now.getDay()]+" · Today";
   $("hDate").textContent=now.toLocaleDateString(undefined,{year:"numeric",month:"long",day:"numeric"});
   document.querySelectorAll(".energyrow button").forEach(b=>b.classList.toggle("on",b.dataset.e===S.energy));
   const list=curList();
-  $("hStatus").textContent=statusFor(list);
   // NOW / NEXT — timeline state always wins; study suggestion is separate and never becomes NOW early
   const n=nowMin();
   const ts=timelineState(list,n);
+  $("hStatus").textContent=ts.now?(ts.now.kind==="study"?("Study: "+ts.now.title):("Now: "+ts.now.title)):(ts.next?("Up next: "+ts.next.title+" at "+ts.next.start):"Day complete — wind down");
   const cur=ts.now, nx=ts.next;
   const sug=suggestionFor(list,cur);
   if(cur){
@@ -390,7 +376,7 @@ function render(){
 }
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 /* ============ ACTIONS ============ */
-function completeTask(id,min){const l=curList();const t=l.find(x=>x.id===id);if(!t||t.status==="done")return;t.status="done";t.actualMin=t.actualMin||min||t.durationMin||0;const k=dateKey(new Date());S.doneMin[k]=(S.doneMin[k]||0)+t.actualMin;if(t.subjectId){S.sessions[t.subjectId]=(S.sessions[t.subjectId]||0)+1}save();render();notify("Done: "+t.title,"Next: "+nextStudyTitle());toast("Completed: "+t.title)}
+function completeTask(id,min){const l=curList();const t=l.find(x=>x.id===id);if(!t||t.status==="done")return;t.status="done";t.actualMin=t.actualMin||min||t.durationMin||0;if(t.subjectId){S.sessions[t.subjectId]=(S.sessions[t.subjectId]||0)+1}save();render();notify("Done: "+t.title,"Next: "+nextStudyTitle());toast("Completed: "+t.title)}
 function nextStudyTitle(){const l=curList();const n=nowMin();const t=l.find(x=>x.kind==="study"&&isOpen(x));return t?t.title+" at "+t.start:"rest"}
 function missTask(id){
   const l=curList();const t=l.find(x=>x.id===id);if(!t)return;t.status="skipped";save();
@@ -399,7 +385,7 @@ function missTask(id){
   const half=Math.ceil((t.durationMin||50)/2);
   pushCatchup(thu,t,half," (catch-up 1/2)");pushCatchup(fri,t,t.durationMin-half," (optional catch-up 2/2)");
   const msg="Missed "+(t.durationMin||"?")+"-min "+t.title+". Moved "+half+" min to Thursday and kept "+(t.durationMin-half)+" min as optional Friday catch-up. Sleep unchanged.";
-  S.log.push(msg);save();render();toast(msg);agentSay(msg);
+  save();render();toast(msg);agentSay(msg);
 }
 function pushCatchup(day,t,min,suffix){
   const k=dateKey(day);ensureDay(day);
@@ -408,12 +394,12 @@ function pushCatchup(day,t,min,suffix){
 }
 function nextDow(from,dow){const d=new Date(from);let i=0;while(d.getDay()!==dow||i===0){d.setDate(d.getDate()+1);i++;if(i>8)break}return d}
 /* ============ FOCUS TIMER ============ */
-let F={id:null,total:50*60,left:50*60,tick:null,mode:"focus",brk:10*60,running:false};
+let F={id:null,left:50*60,tick:null,running:false};
 function openFocus(id){
   const t=curList().find(x=>x.id===id);if(!t){toast("Task not found.");return}
   if(t.status==="done"){toast("Already complete — no duplicates created.");return}
   const s=subj(t.subjectId);const f=s?s.focus:25,b=s?s.brk:5;
-  F={id:t.id,total:(t.durationMin||f)*60,left:(t.durationMin||f)*60,tick:null,mode:"focus",brk:b*60,running:false,planned:t.durationMin||f};
+  F={id:t.id,left:(t.durationMin||f)*60,tick:null,running:false,planned:t.durationMin||f};
   $("fSub").textContent=(s?s.name+" · "+s.code+" · ":"")+t.type;
   $("fTitle").textContent=t.title;$("fMode").textContent=F.planned+" focus / "+b+" break";
   updF();$("focusOv").classList.add("open");
@@ -431,7 +417,7 @@ function onFocusDone(manual){
   const actual=manual!=null?manual:F.planned;
   $("focusOv").classList.remove("open");
   // A finished focus session is NOT task completion: record the minutes, keep the task open.
-  if(t&&isOpen(t)){t.actualMin=(t.actualMin||0)+actual;const k=dateKey(new Date());S.doneMin[k]=(S.doneMin[k]||0)+actual;save();render();notify("Focus session completed",t.title+" — still needs [Mark Done]");}
+  if(t&&isOpen(t)){t.actualMin=(t.actualMin||0)+actual;save();render();notify("Focus session completed",t.title+" — still needs [Mark Done]");}
   else{render()}
   toast("Focus session completed: "+actual+" min. Task still needs [Mark Done].");
 }
@@ -470,14 +456,15 @@ function minDay(){
   S.tasks[k].push({id:k+"-min3",date:k,kind:"study",title:"Prepare tomorrow",detail:"Pack bag + 5 min plan",start:"22:00",end:"22:15",durationMin:15,subjectId:null,type:"Planning",priority:"medium",status:"pending",actualMin:0});
   save();render();toast("Minimum day set: 20 + 20 + prep, then sleep.");
 }
-function catchUpAll(){
+function catchUpAll(silent){
   const l=curList().filter(t=>t.kind==="study"&&isOpen(t));
-  if(!l.length){toast("Nothing behind — you're clear.");return}
-  const low=l.filter(t=>t.priority!=="high");const hi=l.filter(t=>t.priority==="high");
-  low.slice(1).forEach(t=>{t.status="skipped";const thu=nextDow(new Date(),4);pushCatchup(thu,t,Math.min(30,t.durationMin||30)," (moved by catch-up)");});
+  if(!l.length){if(!silent)toast("Nothing behind — you're clear.");return}
+  const low=l.filter(t=>t.priority!=="high"),hi=l.filter(t=>t.priority==="high"),thu=nextDow(new Date(),4);
+  low.slice(1).forEach(t=>{t.status="skipped";pushCatchup(thu,t,Math.min(30,t.durationMin||30)," (moved by catch-up)")});
   save();render();
+  if(silent)return;
   const msg="Kept "+hi.length+" high-priority task(s) today, moved "+Math.max(0,low.length-1)+" lower-priority item(s) to Thursday. Sleep unchanged.";
-  S.log.push(msg);save();agentSay(msg);toast(msg);
+  agentSay(msg);toast(msg);
 }
 function planSummary(){
   const d=new Date(),l=curList();const st=l.filter(t=>t.kind==="study"&&isOpen(t));
@@ -543,7 +530,7 @@ function agentAnswer(q0){
   if(q.includes("missed")||q.includes("signals session")){const t=pend.find(x=>x.subjectId==="EEC115")||pend[0];return t?("I moved your missed "+t.title+" ("+t.durationMin+" min): half to Thursday, half as optional Friday. Tap Missed on the task to apply it. Sleep unchanged."):"No pending Signals — you are caught up.";}
   if(q.includes("assignment")||q.includes("tomorrow")){const dl=S.deadlines[0];return dl?("Top deadline: "+dl.text+" ("+dl.date+" "+(dl.time||"")+"). Do a 30-min Assignment block tonight before 21:30, rest keeps sleep."):"No deadlines saved. Add one and I will prioritize it.";}
   if(q.includes("got home")||q.includes("10 pm")||q.includes("10pm")||q.includes("home at")){return "Late home (10 PM): no full session. Do 15 min review + prep tomorrow, lights out "+CONFIG.sleep.bed+". I will push the rest to Thursday/Friday.";}
-  if(q.includes("move")&&q.includes("remaining")){catchUpAllSilent();return "Moved today's lower-priority remainder to Thursday; kept high-priority + sleep. See timeline.";}
+  if(q.includes("move")&&q.includes("remaining")){catchUpAll(true);return "Moved today's lower-priority remainder to Thursday; kept high-priority + sleep. See timeline.";}
   if(q.includes("catch up")||q.includes("behind")||q.includes("help me")){return catchUpText();}
   if(q.includes("plan")){return planSummary();}
   if(q.includes("sleep")){return "Sleep is protected: "+CONFIG.sleep.bed+"–"+CONFIG.sleep.wake+" ("+CONFIG.sleep.targetHrs+"h+). Never trade sleep for study.";}
@@ -551,7 +538,6 @@ function agentAnswer(q0){
   return "Base timetable kept. Remaining today: "+pend.length+" block(s). Tell me: tired / missed X / move rest / 40 minutes / deadline.";
 }
 function catchUpText(){const l=curList().filter(t=>t.kind==="study"&&isOpen(t));const tot=l.reduce((a,t)=>a+(t.durationMin||0),0);return "Catch-up: "+l.length+" block(s), "+tot+" min left today. I keep high-priority today and shift the rest to Thursday + optional Friday. Sleep unchanged. Tap [I'm Behind] to apply.";}
-function catchUpAllSilent(){const l=curList().filter(t=>t.kind==="study"&&isOpen(t)&&t.priority!=="high").slice(1);const thu=nextDow(new Date(),4);l.forEach(t=>{t.status="skipped";pushCatchup(thu,t,Math.min(30,t.durationMin||30)," (moved)")});save();render()}
 $("chatSend").onclick=()=>{const v=$("chatIn").value.trim();if(v){$("chatIn").value="";agentAsk(v)}};
 document.querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>agentAsk(b.dataset.q));
 /* ============ DEADLINES ============ */
@@ -562,7 +548,7 @@ $("dCancel").onclick=()=>$("deadOv").classList.remove("open");
 document.querySelectorAll("nav.bottom button").forEach(b=>b.onclick=()=>{document.querySelectorAll("nav.bottom button").forEach(x=>x.classList.remove("on"));b.classList.add("on");["today","week","subj","agent"].forEach(t=>$("tab-"+t).hidden=t!==b.dataset.t)});
 document.querySelectorAll(".energyrow button").forEach(b=>b.onclick=()=>{S.energy=b.dataset.e;save();render();toast("Energy: "+S.energy)});
 $("editDay").onchange=()=>{const d=+$("editDay").value;$("editJson").value=JSON.stringify(CONFIG.classes[d]||[])};
-$("editSave").onclick=()=>{try{const d=+$("editDay").value;const v=JSON.parse($("editJson").value);CONFIG.classes[d]=v;localStorage.setItem("uni_classes",JSON.stringify(CONFIG.classes));Object.keys(S.tasks).forEach(k=>{/* keep existing; new days regenerate */});save();render();toast("Class times saved.")}catch(e){toast("Invalid JSON.")}};
+$("editSave").onclick=()=>{try{const d=+$("editDay").value;const v=JSON.parse($("editJson").value);CONFIG.classes[d]=v;localStorage.setItem("uni_classes",JSON.stringify(CONFIG.classes));save();render();toast("Class times saved.")}catch(e){toast("Invalid JSON.")}};
 try{const c=localStorage.getItem("uni_classes");if(c)CONFIG.classes=Object.assign(CONFIG.classes,JSON.parse(c))}catch(e){}
 $("editJson").value=JSON.stringify(CONFIG.classes[6]||[]);
 function notify(t,b){try{if("Notification"in window&&Notification.permission==="granted"){new Notification(t,{body:b||""})}if("Notification"in window&&Notification.permission==="default"){Notification.requestPermission()}}catch(e){}}
@@ -574,7 +560,7 @@ if("Notification"in window&&Notification.permission==="default"){try{Notificatio
 render();
 setInterval(()=>{const n=new Date();$("hClock").textContent=pad(n.getHours())+":"+pad(n.getMinutes())+":"+pad(n.getSeconds())},1000);
 $("hClock").textContent=pad(new Date().getHours())+":"+pad(new Date().getMinutes());
-window.__app={CONFIG,getState:()=>S,ensureDay,completeTask,missTask,agentAnswer,timelineState,containsAt,suggestionFor,eventState,studyState,isOpen,deriveLeaveCampus,deriveEveningCommute,leaveCampusFrom,dayFingerprint};
+window.__app={CONFIG,getState:()=>S,ensureDay,completeTask,missTask,agentAnswer,timelineState,containsAt,suggestionFor,eventState,studyState,isOpen,deriveLeaveCampus,deriveEveningCommute,dayFingerprint};
 </script>
 </body>
 </html>
