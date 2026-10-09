@@ -88,6 +88,7 @@ table.w th,table.w td{text-align:left;padding:8px 6px;border-bottom:1px solid va
     </div></div>
     <div class="card" id="tomCard"><b>Tomorrow preview</b><div id="tomBody" class="small"></div></div>
     <div class="card"><b>Today timeline</b><div class="small mut">Commute · classes · meals · study · breaks · exercise · sleep</div><ul class="tl" id="tl"></ul></div>
+    <div class="card"><b>Pending tasks</b><div class="small mut">Open work with no fixed time — start it or reschedule into a free slot.</div><ul class="tl" id="pendList"></ul></div>
     <div class="card"><b>Deadlines</b><ul class="tl" id="dlList"></ul></div>
     <div class="card"><b>Notes</b><div class="small mut">Sleep wins over study. Recovery wins over optional tasks. No study after 11:00 PM unless you override.</div><label class="small"><input type="checkbox" id="sleepOverride" style="width:auto;min-height:auto"> Allow study after 11 PM tonight (override)</label></div>
   </section>
@@ -178,16 +179,21 @@ function subj(id){return CONFIG.subjects.find(s=>s.id===id)}
 let S={tasks:{},deadlines:[],energy:"normal",first:false,override:{},sessions:{},v:{},fp:{}};
 try{const raw=localStorage.getItem(LS);if(raw){const p=JSON.parse(raw);S=Object.assign(S,p)}}catch(e){}
 function save(){try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}}
+// Heal legacy zero-duration study blocks (old catch-up bug): unschedule in place instead of dropping — no data loss.
+function sanitize(){let ch=false;Object.values(S.tasks||{}).forEach(l=>l.forEach(t=>{if(t.kind==="study"&&t.start!=null&&t.end!=null&&t2m(t.start)===t2m(t.end)&&t.status!=="done"){t.start=null;t.end=null;ch=true}}));Object.values(S.tasks||{}).forEach(l=>settleOverlaps(l));if(ch)save()}
 /* ============ TIME STATE (deterministic: clock vs interval only) ============ */
 // NOW: start <= now < end. UPCOMING: now < start. PAST: now >= end.
 // Priority NEVER affects NOW — it only ranks AI suggestions during free periods.
 function wraps(t){return t2m(t.end)<=t2m(t.start)}
-function containsAt(t,min){const s=t2m(t.start),e=t2m(t.end);if(e<=s)return min>=s||min<e;return s<=min&&min<e}
-function isPastAt(t,min){if(t2m(t.start)===t2m(t.end))return false;if(wraps(t))return false;return t2m(t.end)<=min}
+function containsAt(t,min){if(t.start==null||t.end==null)return false;const s=t2m(t.start),e=t2m(t.end);if(e<=s)return e===s?false:(min>=s||min<e);return s<=min&&min<e}
+function isPastAt(t,min){if(t.start==null||t.end==null)return false;if(t2m(t.start)===t2m(t.end))return false;if(wraps(t))return false;return t2m(t.end)<=min}
 // Clock-derived event state for time-based events (no manual Done needed):
 // done (user-marked) · in-progress (contains now) · completed (past) · upcoming (future)
 function eventState(t,min){if(t.status==="done")return"done";if(containsAt(t,min))return"in-progress";if(isPastAt(t,min))return"completed";return"upcoming"}
-function timelineState(list,min){let now=null,next=null;for(const t of list){if(!now&&containsAt(t,min))now=t}for(const t of list){const s=t2m(t.start);if(s>min&&(!next||s<t2m(next.start)))next=t}return{now:now,next:next}}
+// Valid scheduled slot: real start AND end, non-zero duration. Unscheduled or
+// zero-duration tasks are backlog — never timeline events, never NOW/NEXT.
+function hasSlot(t){return t.start!=null&&t.end!=null&&t2m(t.start)!==t2m(t.end)}
+function timelineState(list,min){let now=null,next=null;for(const t of list){if(!hasSlot(t))continue;if(!now&&containsAt(t,min))now=t}for(const t of list){if(!hasSlot(t))continue;const s=t2m(t.start);if(s>min&&(!next||s<t2m(next.start)))next=t}return{now:now,next:next}}
 function topStudy(list){return list.filter(t=>t.kind==="study"&&isOpen(t)).sort((a,b)=>prW(b)-prW(a))[0]||null}
 // Open user tasks: pending OR started-but-unfinished. Completion is NEVER derived from the clock.
 // A study block ending without explicit action stays open (shown as overdue), never completed.
@@ -227,6 +233,24 @@ function fillGaps(list){
       else if(dur<=45&&nearClass)list.push(Object.assign(base,{kind:"transition",title:"Campus transition",detail:"Move · reset · get ready"}));
       else list.push(Object.assign(base,{kind:"free",title:"Free time",detail:"No class — rest or light review"}));
     }
+  }
+}
+function settleOverlaps(list){
+  for(let pass=0;pass<4;pass++){
+    const studies=list.filter(t=>t.kind==="study"&&hasSlot(t));
+    let changed=false;
+    list.filter(t=>t.kind==="free"||t.kind==="transition"||t.kind==="break").forEach(f=>{
+      studies.forEach(s=>{
+        const fs=t2m(f.start),fe=t2m(f.end),ss=t2m(s.start),se=t2m(s.end);
+        if(ss>fs&&ss<fe){
+          f.end=m2t(ss);
+          if(se<fe)list.push({id:f.date+"-sp"+Date.now()+Math.floor(Math.random()*999),date:f.date,kind:f.kind,title:f.title,detail:f.detail,start:m2t(se),end:m2t(fe),status:"pending",actualMin:0});
+          changed=true;
+        }
+      });
+    });
+    if(!changed)break;
+    list.sort((a,b)=>(a.start!=null&&b.start!=null)?(t2m(a.start)-t2m(b.start)):0);
   }
 }
 function ensureDay(d){
@@ -308,6 +332,7 @@ function ensureDay(d){
     }
   });
   list.sort((a,b)=>t2m(a.start)-t2m(b.start));
+  settleOverlaps(list); // deadline/late pushes can land inside gap fillers — split, never shadow study
   if(oldMarks)list.forEach(t=>{const o=oldMarks[t.kind+"|"+t.title+"|"+t.start];if(o){t.status=o.status;t.actualMin=o.actualMin||0}});
   S.tasks[k]=list;S.v[k]=SCHEMA;S.fp[k]=fp;save();return list;
 }
@@ -330,7 +355,7 @@ function render(){
     $("nowTitle").textContent=cur.title;
     $("nowMeta").textContent=cur.start+"–"+cur.end+" · "+(cur.detail||cur.kind);
     $("nowHint").textContent="NOW · "+cur.kind+(sug?(" · Suggested: "+sug.title+" ("+sug.durationMin+" min)."):"");
-    const unf=list.filter(t=>t.kind==="study"&&isOpen(t)&&isPastAt(t,n));
+    const unf=list.filter(t=>t.kind==="study"&&isOpen(t)&&hasSlot(t)&&isPastAt(t,n));
     if(unf.length&&(cur.kind==="sleep"||cur.title==="Wind down"||!nx)){$("nowHint").textContent+=" "+unf.length+" task(s) unfinished.";}
     if(cur.kind==="study"&&isOpen(cur)){$("nowStart").style.display="";$("nowStart").onclick=()=>openFocus(cur.id);}
     else if(sug){$("nowStart").style.display="";$("nowStart").onclick=()=>openFocus(sug.id);}
@@ -351,9 +376,9 @@ function render(){
   if(nx){$("nextTitle").textContent=nx.title;$("nextMeta").textContent=nx.start+"–"+nx.end+" · "+(nx.detail||nx.kind);}
   else if(cur&&cur.kind==="sleep"){$("nextTitle").textContent="Wake up 06:00";$("nextMeta").textContent="Tomorrow starts fresh";}
   else{$("nextTitle").textContent="—";$("nextMeta").textContent="Day complete";}
-  // timeline
+  // timeline — scheduled events only; unscheduled/zero-duration tasks live in Pending tasks
   const ul=$("tl");ul.innerHTML="";
-  list.forEach(t=>{
+  list.filter(hasSlot).forEach(t=>{
     // Study rows use completionStatus (explicit user state); time events use clock-derived eventState.
     // A past-end untouched study task is OVERDUE (full opacity + red badge), never completed.
     const st8=t.kind==="study"?studyState(t,n):eventState(t,n);
@@ -367,6 +392,21 @@ function render(){
     const ac=li.querySelector(".tact");
     if(t.kind==="study"&&isOpen(t)){const b1=document.createElement("button");b1.textContent="Start";b1.onclick=()=>openFocus(t.id);const b2=document.createElement("button");b2.textContent="Mark Done";b2.onclick=()=>completeTask(t.id);const b3=document.createElement("button");b3.textContent="Reschedule";b3.onclick=()=>missTask(t.id);ac.append(b1,b2,b3);}
     ul.append(li);
+  });
+  // pending tasks — open study work with no valid scheduled slot (no fabricated times)
+  const pl=$("pendList");pl.innerHTML="";
+  const openUn=list.filter(t=>t.kind==="study"&&isOpen(t)&&!hasSlot(t));
+  if(!openUn.length)pl.innerHTML="<li class='small mut'>Nothing pending — all open work has a scheduled slot.</li>";
+  openUn.forEach(t=>{
+    const li=document.createElement("li");
+    const pr2=t.priority==="high"?'<span class="badge hi">high</span>':t.priority==="medium"?'<span class="badge med">med</span>':t.priority==="low"?'<span class="badge low">low</span>':"";
+    li.innerHTML='<span class="dot"></span><span class="tbody"><b>'+esc(t.title)+pr2+'</b><small>'+esc(t.detail||t.kind)+(t.durationMin?" · "+t.durationMin+" min":"")+(t.actualMin?" · did "+t.actualMin+"m":"")+' · no fixed time</small><span class="tact"></span></span>';
+    const ac2=li.querySelector(".tact");
+    const p1=document.createElement("button");p1.textContent="Start";p1.onclick=()=>openFocus(t.id);
+    const p2=document.createElement("button");p2.textContent="Mark Done";p2.onclick=()=>completeTask(t.id);
+    const p3=document.createElement("button");p3.textContent="Reschedule";p3.onclick=()=>missTask(t.id);
+    ac2.append(p1,p2,p3);
+    pl.append(li);
   });
   // deadlines
   const dl=$("dlList");dl.innerHTML=S.deadlines.length?"":"<li class='small mut'>No deadlines. Add one with [+ Add Deadline].</li>";
@@ -389,7 +429,7 @@ function missTask(id){
 }
 function pushCatchup(day,t,min,suffix){
   const k=dateKey(day);ensureDay(day);
-  S.tasks[k].push({id:k+"-c"+Date.now()+Math.floor(Math.random()*999),date:k,kind:"study",title:t.title,detail:t.detail+suffix,start:"18:00",end:"18:00",durationMin:min,subjectId:t.subjectId,type:"Catch-up",priority:t.priority,status:"pending",actualMin:0});
+  S.tasks[k].push({id:k+"-c"+Date.now()+Math.floor(Math.random()*999),date:k,kind:"study",title:t.title,detail:t.detail+suffix,start:null,end:null,durationMin:min,subjectId:t.subjectId,type:"Catch-up",priority:t.priority,status:"pending",actualMin:0}); // unscheduled: no fabricated time — lives in Pending tasks until given a real slot
   save();
 }
 function nextDow(from,dow){const d=new Date(from);let i=0;while(d.getDay()!==dow||i===0){d.setDate(d.getDate()+1);i++;if(i>8)break}return d}
@@ -454,7 +494,7 @@ function minDay(){
   S.tasks[k].push({id:k+"-min1",date:k,kind:"study",title:subj(main[0]).name,detail:"20 min review (minimum day)",start:"18:00",end:"18:20",durationMin:20,subjectId:main[0],type:"Lecture review",priority:"high",status:"pending",actualMin:0});
   S.tasks[k].push({id:k+"-min2",date:k,kind:"study",title:subj(main[0]).name,detail:"20 min easy questions",start:"18:30",end:"18:50",durationMin:20,subjectId:main[0],type:"Problem solving",priority:"high",status:"pending",actualMin:0});
   S.tasks[k].push({id:k+"-min3",date:k,kind:"study",title:"Prepare tomorrow",detail:"Pack bag + 5 min plan",start:"22:00",end:"22:15",durationMin:15,subjectId:null,type:"Planning",priority:"medium",status:"pending",actualMin:0});
-  save();render();toast("Minimum day set: 20 + 20 + prep, then sleep.");
+  save();settleOverlaps(S.tasks[k]);save();render();toast("Minimum day set: 20 + 20 + prep, then sleep.");
 }
 function catchUpAll(silent){
   const l=curList().filter(t=>t.kind==="study"&&isOpen(t));
@@ -554,13 +594,14 @@ $("editJson").value=JSON.stringify(CONFIG.classes[6]||[]);
 function notify(t,b){try{if("Notification"in window&&Notification.permission==="granted"){new Notification(t,{body:b||""})}if("Notification"in window&&Notification.permission==="default"){Notification.requestPermission()}}catch(e){}}
 setInterval(()=>{render()},30000);
 setInterval(()=>{ // gentle reminders without dependency
-  try{const l=curList();const n=nowMin();l.forEach(t=>{if(isOpen(t)&&t2m(t.start)-n===10)notify(t.title+" in 10 min",t.start)})}catch(e){}
+  try{const l=curList();const n=nowMin();l.forEach(t=>{if(isOpen(t)&&t.start&&t2m(t.start)-n===10)notify(t.title+" in 10 min",t.start)})}catch(e){}
 },60000);
 if("Notification"in window&&Notification.permission==="default"){try{Notification.requestPermission()}catch(e){}}
+sanitize();
 render();
 setInterval(()=>{const n=new Date();$("hClock").textContent=pad(n.getHours())+":"+pad(n.getMinutes())+":"+pad(n.getSeconds())},1000);
 $("hClock").textContent=pad(new Date().getHours())+":"+pad(new Date().getMinutes());
-window.__app={CONFIG,getState:()=>S,ensureDay,completeTask,missTask,agentAnswer,timelineState,containsAt,suggestionFor,eventState,studyState,isOpen,deriveLeaveCampus,deriveEveningCommute,dayFingerprint};
+window.__app={CONFIG,getState:()=>S,ensureDay,completeTask,missTask,agentAnswer,timelineState,containsAt,suggestionFor,eventState,studyState,isOpen,hasSlot,deriveLeaveCampus,deriveEveningCommute,dayFingerprint};
 </script>
 </body>
 </html>
